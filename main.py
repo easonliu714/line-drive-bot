@@ -52,7 +52,6 @@ def retry(func, retries=3, delay=2):
             time.sleep(delay)
     raise RuntimeError("All retries failed")
 
-
 def gemini_summarize_and_tag(text: str) -> dict:
     prompt = f"""
 請用繁體中文回覆，格式為 JSON：
@@ -64,9 +63,33 @@ def gemini_summarize_and_tag(text: str) -> dict:
 內容：
 {text}
 """
-    response = gemini_model.generate_content(prompt)
-    return json.loads(response.text)
+    try:
+        # 送出請求
+        response = gemini_model.generate_content(prompt)
+        
+        # 1. 檢查是否有內容 (避免 Safety Filter 擋住導致無內容)
+        if not response.parts:
+            logger.warning("Gemini response blocked or empty.")
+            return {"summary": text[:50], "tags": ["uncategorized"]}
 
+        # 2. 清理 Markdown 格式 (去除 ```json 和 ```)
+        content = response.text.strip()
+        if content.startswith("```"):
+            # 去掉開頭的 ```json 或 ```
+            lines = content.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            content = "\n".join(lines)
+        
+        # 3. 解析 JSON
+        return json.loads(content)
+
+    except Exception as e:
+        logger.error(f"Gemini processing failed: {e}")
+        # 萬一還是失敗，回傳一個預設值，確保程式不會 Crash
+        return {"summary": text[:50], "tags": ["error"]}
 
 def get_or_create_folder(parent_id: str, folder_name: str) -> str:
     query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents"
