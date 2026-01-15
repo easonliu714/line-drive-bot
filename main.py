@@ -22,9 +22,10 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # 環境變數（由 Cloud Run / Secret 注入）
-LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
-GDRIVE_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"]
+# 使用 .strip() 去除可能誤貼的換行符號或空白
+LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"].strip()
+GEMINI_KEY = os.environ["GEMINI_API_KEY"].strip()
+GDRIVE_FOLDER_ID = os.environ["GDRIVE_FOLDER_ID"].strip()
 
 line_bot_api = LineBotApi(LINE_TOKEN)
 parser = WebhookParser(os.environ.get("LINE_CHANNEL_SECRET", ""))
