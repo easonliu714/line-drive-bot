@@ -31,7 +31,7 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 parser = WebhookParser(os.environ.get("LINE_CHANNEL_SECRET", ""))
 
 genai.configure(api_key=GEMINI_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+gemini_model = genai.GenerativeModel("gemini-flash-latest")
 
 # -------------------------------------------------
 # Google Drive（使用 Cloud Run 預設 Service Account）
