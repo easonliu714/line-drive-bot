@@ -4,6 +4,7 @@ import time
 import logging
 import shutil
 import sys
+import re  # 新增 re 模組處理字串
 from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookParser
@@ -51,7 +52,8 @@ else:
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    gemini_model = genai.GenerativeModel("gemini-flash-latest")
+    # 使用標準名稱 gemini-1.5-flash 以確保最穩定相容性
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # -------------------------------------------------
 # Session Manager (錄製模式)
@@ -107,12 +109,14 @@ def retry(func, retries=3, delay=2):
     raise RuntimeError("All retries failed")
 
 def clean_json_text(text: str) -> str:
+    """增強版 JSON 清理：移除 Markdown 與可能的雜訊"""
     text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines[0].startswith("```"): lines = lines[1:]
-        if lines and lines[-1].startswith("```"): lines = lines[:-1]
-        text = "\n".join(lines)
+    # 移除 ```json ... ``` 包裹
+    if "```" in text:
+        # 使用正規表達式提取 ```json 與 ``` 中間的內容
+        match = re.search(r'```(?:json)?(.*?)```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
     return text
 
 def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> dict:
@@ -121,45 +125,40 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
     has_images = len(file_paths) > 0
     
     # -------------------------------------------------
-    # Prompt 優化：加入「有無圖片」的邏輯判斷，防止幻覺
+    # Prompt 優化：針對純網址情境加強 JSON 規範
     # -------------------------------------------------
     
-    # 基礎指令
     base_prompt = f"""
     你是一個專業的數位歸檔秘書。
     使用者指定的情境為：「{context_name}」。
-    你收到了使用者轉傳的內容。
 
-    **你的任務目標：**
-    1. **分析內容**：根據提供的文字{ "與圖片" if has_images else "" }進行歸納。
-    2. **標籤提取**：提取人、事、時、地、物作為標籤。
+    **任務：**
+    1. 分析使用者轉傳的內容並歸納。
+    2. 提取關鍵字作為標籤。
     """
 
-    # 針對圖片的特殊指令 (只有在真的有圖片時才加入)
     if has_images:
         base_prompt += """
-    3. **OCR 與視覺分析**：
-       - 請仔細閱讀圖片中的文字。
-       - 如果是收據、文件、名片，**請務必提取**日期、金額、店名。
-       - 如果是活動照片，請描述畫面內容。
+    3. **圖片分析**：
+       - 請仔細閱讀圖片中的文字 (OCR)。
+       - 提取日期、金額、店名、活動名稱。
         """
     else:
         base_prompt += """
-    3. **純文字處理**：
-       - **嚴禁捏造**：既然沒有提供圖片，請不要幻想出任何圖片的分析結果（如收據、發票）。
-       - **網址處理**：如果內容包含 URL (https://...)，請將其記錄為「參考連結」，不要試圖分析網頁內文（除非使用者有提供網頁截圖）。
+    3. **純文字/連結處理**：
+       - **嚴禁捏造**：沒有圖片就不要捏造收據或發票內容。
+       - **網址處理**：如果內容僅包含網址 (URL)，請依據網址特徵判斷類別（例如 chatgpt 是 AI 工具、youtube 是影片），並將其記錄為「參考連結」。
+       - **重要**：即使你無法瀏覽該網址，也**必須**回傳下方指定的 JSON 格式，不可以只回傳一句話。
         """
 
-    # 結尾格式要求
     base_prompt += f"""
-    請回傳 JSON 格式：
+    **回傳格式 (必須是合法的 JSON)：**
     {{
       "source": "{context_name}",
       "category": "精確類別",
-      "summary": "重點摘要。{'包含圖片OCR結果' if has_images else '針對文字對話的總結' }。",
+      "summary": "重點摘要。{'包含圖片OCR結果' if has_images else '針對內容的總結' }。",
       "tags": ["關鍵字1", "關鍵字2"]
     }}
-    注意：'source' 請優先使用「{context_name}」。
     """
     
     content_parts = [base_prompt]
@@ -176,11 +175,30 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
 
     try:
         response = gemini_model.generate_content(content_parts)
-        if not response.parts: return {"source": context_name, "category": "未分類", "summary": "AI 無法讀取內容", "tags": []}
+        
+        # 1. 檢查是否被 Safety Filter 擋下
+        if not response.parts:
+            logger.warning("Gemini 回傳空內容 (可能被 Safety Filter 阻擋)")
+            return {"source": context_name, "category": "未分類", "summary": "AI 無法讀取內容 (安全性阻擋)", "tags": []}
+
+        # 2. 印出原始回應 (Debug 關鍵)
+        logger.info(f"Gemini Raw Response: {response.text}")
+
+        # 3. 解析 JSON
         return json.loads(clean_json_text(response.text))
+
     except Exception as e:
-        logger.error(f"Gemini 分析失敗: {e}")
-        return {"source": context_name, "category": "錯誤", "summary": "分析失敗", "tags": ["error"]}
+        logger.error(f"Gemini 分析/解析失敗: {e}")
+        # 如果是 JSON 解析失敗，通常代表 AI 回傳了普通文字，我們可以試著把那段文字當作摘要
+        if "Expecting value" in str(e) and response and response.text:
+             return {
+                 "source": context_name, 
+                 "category": "格式錯誤", 
+                 "summary": f"AI 回傳了非 JSON 格式: {response.text[:100]}", 
+                 "tags": ["error"]
+             }
+             
+        return {"source": context_name, "category": "系統錯誤", "summary": "分析過程發生例外", "tags": ["error"]}
 
 def get_or_create_folder(service, parent_id: str, folder_name: str) -> str:
     if not parent_id: raise ValueError("Parent ID is empty")
@@ -204,7 +222,7 @@ def upload_file_to_drive(service, local_path: str, filename: str, folder_id: str
     file_metadata = {
         "name": filename, 
         "parents": [folder_id], 
-        "description": description  # 關鍵：將 OCR 結果寫入檔案說明
+        "description": description
     }
     service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
@@ -235,7 +253,6 @@ def callback():
 def handle_message(event: MessageEvent):
     user_id = event.source.user_id
     
-    # 處理文字指令
     if isinstance(event.message, TextMessage):
         text = event.message.text.strip()
         
@@ -254,19 +271,15 @@ def handle_message(event: MessageEvent):
                 line_bot_api.reply_message(event.reply_token, TextMessage(text="目前沒有進行中的錄製。"))
                 return
             
-            line_bot_api.reply_message(event.reply_token, TextMessage(text=f"【處理中】\n共 {len(session['texts'])} 則訊息、{len(session['files'])} 個檔案...\n正在提取重點與 OCR..."))
+            line_bot_api.reply_message(event.reply_token, TextMessage(text=f"【處理中】\n共 {len(session['texts'])} 則訊息、{len(session['files'])} 個檔案..."))
             
             try:
                 service = get_drive_service()
-                # 1. AI 分析
                 ai_result = retry(lambda: analyze_batch_content(session['context'], session['texts'], session['files']))
                 folder_id = get_target_folder_id(service, GDRIVE_FOLDER_ID, ai_result.get("source"), ai_result.get("category", "雜項"))
                 
-                # 準備寫入 Description 的內容 (摘要 + 標籤)
-                # 這會讓你在 Drive 搜尋時能搜到圖片內的文字
                 full_description = f"AI摘要: {ai_result['summary']}\n\n標籤: {', '.join(ai_result.get('tags', []))}"
 
-                # 2. 彙整文字檔
                 if session['texts']:
                     log_filename = f"chat_batch_{int(time.time())}.txt"
                     with open(log_filename, "w", encoding="utf-8") as f:
@@ -279,15 +292,8 @@ def handle_message(event: MessageEvent):
                     upload_file_to_drive(service, log_filename, log_filename, folder_id, description=full_description)
                     os.remove(log_filename)
                 
-                # 3. 上傳圖片 (關鍵：寫入 Description)
                 for fp in session['files']:
-                    upload_file_to_drive(
-                        service, 
-                        fp, 
-                        os.path.basename(fp), 
-                        folder_id, 
-                        description=full_description # 每一張圖片都會帶有這次分析的重點摘要
-                    )
+                    upload_file_to_drive(service, fp, os.path.basename(fp), folder_id, description=full_description)
                     os.remove(fp)
 
                 line_bot_api.push_message(user_id, TextMessage(text=f"✅ 完成！\n分類：{ai_result.get('category')}\n重點：{ai_result.get('summary')[:100]}..."))
@@ -297,7 +303,6 @@ def handle_message(event: MessageEvent):
                 line_bot_api.push_message(user_id, TextMessage(text="❌ 處理失敗，請檢查系統紀錄。"))
             return
 
-    # 錄製過程
     session = get_session(user_id)
     if session and session['active']:
         saved_path = None
@@ -316,9 +321,8 @@ def handle_message(event: MessageEvent):
 
         add_to_session(user_id, text=txt_content, file_path=saved_path)
     else:
-        # 非錄製模式提示
         if isinstance(event.message, TextMessage):
-             line_bot_api.reply_message(event.reply_token, TextMessage(text="請輸入「開始 [名稱]」來啟動智能歸檔模式。\n我會幫你做 OCR 與重點整理！"))
+             line_bot_api.reply_message(event.reply_token, TextMessage(text="請輸入「開始 [名稱]」來啟動智能歸檔模式。"))
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
