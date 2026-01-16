@@ -52,8 +52,8 @@ else:
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    # 使用標準名稱 gemini-1.5-flash 以確保最穩定相容性
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    # 使用標準名稱 gemini-1.5-flash 發生錯誤，改回 gemini-flash-latest 以確保最穩定相容性
+    gemini_model = genai.GenerativeModel("gemini-flash-latest")
 
 # -------------------------------------------------
 # Session Manager (錄製模式)
