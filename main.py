@@ -116,38 +116,57 @@ def clean_json_text(text: str) -> str:
     return text
 
 def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> dict:
-    logger.info("呼叫 Gemini 進行詳細 OCR 與分析...")
+    logger.info("呼叫 Gemini 進行批次分析...")
     combined_text = "\n".join(texts)
+    has_images = len(file_paths) > 0
     
     # -------------------------------------------------
-    # Prompt 升級：強調 OCR 與結構化資訊提取
+    # Prompt 優化：加入「有無圖片」的邏輯判斷，防止幻覺
     # -------------------------------------------------
+    
+    # 基礎指令
     base_prompt = f"""
-    你是一個高階的數位歸檔與數據分析秘書。
+    你是一個專業的數位歸檔秘書。
     使用者指定的情境為：「{context_name}」。
-    你收到了一組來自 LINE 的訊息（包含文字與多張圖片）。
+    你收到了使用者轉傳的內容。
 
     **你的任務目標：**
-    1. **OCR 與視覺分析**：請仔細閱讀圖片中的所有文字。如果是文件、簡報、收據、名片或海報，**必須**提取其中的關鍵資訊（日期、時間、金額、地點、人名、議程、待辦事項）。
-    2. **資訊整合**：請將圖片提取出的資訊與文字訊息結合，不要只寫「這是一張截圖」，要寫出「截圖顯示 2024/10/5 下午兩點有會議」。
-    3. **標籤優化**：標籤必須包含圖片內的關鍵字（例如店名、專案代號），以利後續搜尋。
+    1. **分析內容**：根據提供的文字{ "與圖片" if has_images else "" }進行歸納。
+    2. **標籤提取**：提取人、事、時、地、物作為標籤。
+    """
 
+    # 針對圖片的特殊指令 (只有在真的有圖片時才加入)
+    if has_images:
+        base_prompt += """
+    3. **OCR 與視覺分析**：
+       - 請仔細閱讀圖片中的文字。
+       - 如果是收據、文件、名片，**請務必提取**日期、金額、店名。
+       - 如果是活動照片，請描述畫面內容。
+        """
+    else:
+        base_prompt += """
+    3. **純文字處理**：
+       - **嚴禁捏造**：既然沒有提供圖片，請不要幻想出任何圖片的分析結果（如收據、發票）。
+       - **網址處理**：如果內容包含 URL (https://...)，請將其記錄為「參考連結」，不要試圖分析網頁內文（除非使用者有提供網頁截圖）。
+        """
+
+    # 結尾格式要求
+    base_prompt += f"""
     請回傳 JSON 格式：
     {{
       "source": "{context_name}",
-      "category": "精確類別 (如: 會議記錄, 財務報銷, 行程規劃, 簡報素材, 旅遊回憶)",
-      "summary": "詳細的重點內容摘要。如果是多張圖片，請條列出每張圖的重點資訊（例如：圖片包含一張 $500 的星巴克發票，以及一張前往台北的車票）。這段摘要將用於搜尋。",
-      "tags": ["關鍵字1", "關鍵字2", "日期", "人名", "地點"]
+      "category": "精確類別",
+      "summary": "重點摘要。{'包含圖片OCR結果' if has_images else '針對文字對話的總結' }。",
+      "tags": ["關鍵字1", "關鍵字2"]
     }}
     注意：'source' 請優先使用「{context_name}」。
     """
     
     content_parts = [base_prompt]
-    if combined_text: content_parts.append(f"\n補充文字對話：\n{combined_text}")
+    if combined_text: content_parts.append(f"\n文字與連結內容：\n{combined_text}")
     
     for path in file_paths:
         try:
-            # 簡單判斷圖片類型，預設 jpeg
             mime_type = "image/jpeg"
             with open(path, "rb") as f:
                 image_data = f.read()
