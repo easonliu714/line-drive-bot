@@ -54,7 +54,7 @@ else:
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
     # 更新 requirements.txt 後，我們就能安全使用標準名稱
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    gemini_model = genai.GenerativeModel("gemini-flash-latest")
 
 # -------------------------------------------------
 # Session Manager (錄製模式)
