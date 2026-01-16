@@ -4,13 +4,14 @@ import time
 import logging
 import shutil
 import sys
-import re  # 新增 re 模組處理字串
+import re
 from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookParser
 from linebot.models import MessageEvent, TextMessage, ImageMessage, FileMessage
 
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold  # 新增：匯入安全設定類型
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -52,8 +53,8 @@ else:
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    # 使用標準名稱 gemini-1.5-flash 發生錯誤，改回 gemini-flash-latest 以確保最穩定相容性
-    gemini_model = genai.GenerativeModel("gemini-flash-latest")
+    # 更新 requirements.txt 後，我們就能安全使用標準名稱
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # -------------------------------------------------
 # Session Manager (錄製模式)
@@ -109,11 +110,8 @@ def retry(func, retries=3, delay=2):
     raise RuntimeError("All retries failed")
 
 def clean_json_text(text: str) -> str:
-    """增強版 JSON 清理：移除 Markdown 與可能的雜訊"""
     text = text.strip()
-    # 移除 ```json ... ``` 包裹
     if "```" in text:
-        # 使用正規表達式提取 ```json 與 ``` 中間的內容
         match = re.search(r'```(?:json)?(.*?)```', text, re.DOTALL)
         if match:
             text = match.group(1).strip()
@@ -125,7 +123,7 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
     has_images = len(file_paths) > 0
     
     # -------------------------------------------------
-    # Prompt 優化：針對純網址情境加強 JSON 規範
+    # Prompt
     # -------------------------------------------------
     
     base_prompt = f"""
@@ -147,8 +145,7 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
         base_prompt += """
     3. **純文字/連結處理**：
        - **嚴禁捏造**：沒有圖片就不要捏造收據或發票內容。
-       - **網址處理**：如果內容僅包含網址 (URL)，請依據網址特徵判斷類別（例如 chatgpt 是 AI 工具、youtube 是影片），並將其記錄為「參考連結」。
-       - **重要**：即使你無法瀏覽該網址，也**必須**回傳下方指定的 JSON 格式，不可以只回傳一句話。
+       - **網址處理**：如果內容僅包含網址 (URL)，請將其記錄為「參考連結」，不要試圖分析網頁內文（除非使用者有提供網頁截圖），但必須回傳 JSON。
         """
 
     base_prompt += f"""
@@ -174,30 +171,37 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
             logger.error(f"讀圖失敗: {e}")
 
     try:
-        response = gemini_model.generate_content(content_parts)
+        # -------------------------------------------------
+        # 關鍵修正：加入 Safety Settings 解決網址被擋問題
+        # -------------------------------------------------
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
+
+        response = gemini_model.generate_content(
+            content_parts, 
+            safety_settings=safety_settings
+        )
         
-        # 1. 檢查是否被 Safety Filter 擋下
         if not response.parts:
-            logger.warning("Gemini 回傳空內容 (可能被 Safety Filter 阻擋)")
-            return {"source": context_name, "category": "未分類", "summary": "AI 無法讀取內容 (安全性阻擋)", "tags": []}
+            logger.warning("Gemini 回傳空內容 (Safety Filter)")
+            return {"source": context_name, "category": "未分類", "summary": "內容被安全性阻擋", "tags": []}
 
-        # 2. 印出原始回應 (Debug 關鍵)
         logger.info(f"Gemini Raw Response: {response.text}")
-
-        # 3. 解析 JSON
         return json.loads(clean_json_text(response.text))
 
     except Exception as e:
         logger.error(f"Gemini 分析/解析失敗: {e}")
-        # 如果是 JSON 解析失敗，通常代表 AI 回傳了普通文字，我們可以試著把那段文字當作摘要
-        if "Expecting value" in str(e) and response and response.text:
+        if response and hasattr(response, 'text') and response.text:
              return {
                  "source": context_name, 
                  "category": "格式錯誤", 
                  "summary": f"AI 回傳了非 JSON 格式: {response.text[:100]}", 
                  "tags": ["error"]
              }
-             
         return {"source": context_name, "category": "系統錯誤", "summary": "分析過程發生例外", "tags": ["error"]}
 
 def get_or_create_folder(service, parent_id: str, folder_name: str) -> str:
