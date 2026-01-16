@@ -11,7 +11,7 @@ from linebot import LineBotApi, WebhookParser
 from linebot.models import MessageEvent, TextMessage, ImageMessage, FileMessage
 
 import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold  # 新增：匯入安全設定類型
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -45,6 +45,13 @@ CLIENT_ID = get_env_var("GOOGLE_CLIENT_ID")
 CLIENT_SECRET = get_env_var("GOOGLE_CLIENT_SECRET")
 REFRESH_TOKEN = get_env_var("GOOGLE_REFRESH_TOKEN")
 
+# -------------------------------------------------
+# 模型設定 (可在此調整模型名稱)
+# -------------------------------------------------
+# 根據你的測試，使用能成功運作的名稱
+# 常見有效名稱：gemini-1.5-flash, gemini-1.5-flash-latest, gemini-pro
+MODEL_NAME = "gemini-1.5-flash-latest" 
+
 if LINE_TOKEN and LINE_SECRET:
     line_bot_api = LineBotApi(LINE_TOKEN)
     parser = WebhookParser(LINE_SECRET)
@@ -53,11 +60,13 @@ else:
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
-    # 更新 requirements.txt 後，我們就能安全使用標準名稱
-    gemini_model = genai.GenerativeModel("gemini-flash-latest")
+    try:
+        gemini_model = genai.GenerativeModel(MODEL_NAME)
+    except Exception as e:
+        logger.error(f"模型設定失敗，請確認名稱: {e}")
 
 # -------------------------------------------------
-# Session Manager (錄製模式)
+# Session Manager
 # -------------------------------------------------
 user_sessions = {}
 
@@ -85,7 +94,7 @@ def end_session(user_id):
     return None
 
 # -------------------------------------------------
-# Google Services 工具函式
+# Google Services
 # -------------------------------------------------
 
 def get_drive_service():
@@ -110,7 +119,9 @@ def retry(func, retries=3, delay=2):
     raise RuntimeError("All retries failed")
 
 def clean_json_text(text: str) -> str:
+    """清理 JSON 字串，移除 Markdown 與多餘文字"""
     text = text.strip()
+    # 移除 ```json 包裹
     if "```" in text:
         match = re.search(r'```(?:json)?(.*?)```', text, re.DOTALL)
         if match:
@@ -122,44 +133,44 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
     combined_text = "\n".join(texts)
     has_images = len(file_paths) > 0
     
-    # -------------------------------------------------
-    # Prompt
-    # -------------------------------------------------
-    
+    # Prompt 優化：加入 "Output raw JSON only" 防止 AI 多嘴
     base_prompt = f"""
-    你是一個專業的數位歸檔秘書。
-    使用者指定的情境為：「{context_name}」。
+    Role: Professional Digital Archivist.
+    Context: "{context_name}".
+    Task: Analyze the provided content (text/images/links) and extract structured data.
+    
+    **CRITICAL OUTPUT RULE:** - Output ONLY valid JSON. 
+    - Do NOT add any conversational text (e.g., "Here is the JSON", "I have analyzed...").
+    - Do NOT use Markdown code blocks if possible, just the raw JSON string.
 
-    **任務：**
-    1. 分析使用者轉傳的內容並歸納。
-    2. 提取關鍵字作為標籤。
+    Analysis Rules:
+    1. **Summary**: Summarize the conversation or content.
+    2. **Tags**: Extract keywords (Person, Action, Date, Place, Item).
     """
 
     if has_images:
         base_prompt += """
-    3. **圖片分析**：
-       - 請仔細閱讀圖片中的文字 (OCR)。
-       - 提取日期、金額、店名、活動名稱。
+    3. **Images (OCR)**: Extract ALL visible text (Date, Amount, Shop Name). Describe the scene if no text.
         """
     else:
         base_prompt += """
-    3. **純文字/連結處理**：
-       - **嚴禁捏造**：沒有圖片就不要捏造收據或發票內容。
-       - **網址處理**：如果內容僅包含網址 (URL)，請將其記錄為「參考連結」，不要試圖分析網頁內文（除非使用者有提供網頁截圖），但必須回傳 JSON。
+    3. **Text/Links**: 
+       - If URL exists, categorize it (e.g., 'Reference Link').
+       - DO NOT hallucinate receipt/invoice details if no image is provided.
         """
 
     base_prompt += f"""
-    **回傳格式 (必須是合法的 JSON)：**
+    **JSON Structure:**
     {{
       "source": "{context_name}",
-      "category": "精確類別",
-      "summary": "重點摘要。{'包含圖片OCR結果' if has_images else '針對內容的總結' }。",
-      "tags": ["關鍵字1", "關鍵字2"]
+      "category": "Category Name",
+      "summary": "Detailed summary here...",
+      "tags": ["tag1", "tag2"]
     }}
     """
     
     content_parts = [base_prompt]
-    if combined_text: content_parts.append(f"\n文字與連結內容：\n{combined_text}")
+    if combined_text: content_parts.append(f"\nContent:\n{combined_text}")
     
     for path in file_paths:
         try:
@@ -170,10 +181,10 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
         except Exception as e:
             logger.error(f"讀圖失敗: {e}")
 
+    # 初始化變數避免 UnboundLocalError
+    response = None
+
     try:
-        # -------------------------------------------------
-        # 關鍵修正：加入 Safety Settings 解決網址被擋問題
-        # -------------------------------------------------
         safety_settings = {
             HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -190,16 +201,19 @@ def analyze_batch_content(context_name: str, texts: list, file_paths: list) -> d
             logger.warning("Gemini 回傳空內容 (Safety Filter)")
             return {"source": context_name, "category": "未分類", "summary": "內容被安全性阻擋", "tags": []}
 
+        # Debug: 印出原始回應
         logger.info(f"Gemini Raw Response: {response.text}")
+        
         return json.loads(clean_json_text(response.text))
 
     except Exception as e:
         logger.error(f"Gemini 分析/解析失敗: {e}")
+        # 修正後的錯誤處理邏輯
         if response and hasattr(response, 'text') and response.text:
              return {
                  "source": context_name, 
                  "category": "格式錯誤", 
-                 "summary": f"AI 回傳了非 JSON 格式: {response.text[:100]}", 
+                 "summary": f"AI 回傳了非 JSON 格式，請檢查 Log。", 
                  "tags": ["error"]
              }
         return {"source": context_name, "category": "系統錯誤", "summary": "分析過程發生例外", "tags": ["error"]}
