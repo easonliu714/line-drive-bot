@@ -47,7 +47,7 @@ CLIENT_SECRET = get_env_var("GOOGLE_CLIENT_SECRET")
 REFRESH_TOKEN = get_env_var("GOOGLE_REFRESH_TOKEN")
 
 # 模型名稱設定
-MODEL_NAME = "gemini-1.5-flash-latest"
+MODEL_NAME = "gemini-flash-latest"
 
 if LINE_TOKEN and LINE_SECRET:
     line_bot_api = LineBotApi(LINE_TOKEN)
